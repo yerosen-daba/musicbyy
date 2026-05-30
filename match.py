@@ -1,83 +1,169 @@
-import math
+"""
+match.py — Compatibility scoring + nearest-neighbor recommendations.
+
+Compatibility scoring:
+  * Each user is represented by the mean of their songs' 53-dim feature
+    vectors (their "musical fingerprint" in audio-feature space).
+  * Overall similarity is a weighted blend of three subspace scores:
+      - energy  — RMS, spectral centroid/rolloff/bandwidth, ZCR
+      - tempo   — measured BPM (gaussian on raw BPM; cosine on 1-D degenerates)
+      - mood    — MFCC timbre + chroma + tonnetz + major/minor mode
+
+Recommendations:
+  * Compute the midpoint vector between the two users.
+  * Search the ENTIRE cached feature pool for the songs whose vectors are
+    closest to that midpoint (cosine similarity, vectorized in numpy).
+  * Return the top 6 with unique artists, excluding the input songs/artists.
+  * Quality scales with cache size — a 5k-song cache produces dramatically
+    richer discovery than a 500-song cache. The prewarm script is what
+    seeds this pool.
+"""
+
 import asyncio
-import client
-from deezer import enrich_track
+import math
+import time
 
-def mean(xs):
-    return sum(xs) / len(xs) if xs else 0.0
+import numpy as np
 
-def gaussian_sim(diff: float, sigma: float) -> float:
-    """Gaussian similarity: 1.0 when diff=0, drops toward 0 as diff grows."""
-    return math.exp(-(diff * diff) / (2 * sigma * sigma)) # expression for bell curve. diff = difference between the two features you are comparing. sigma = sensitivity
+import analyzer
+import cache
+
+
+# ─── Subscore configuration ──────────────────────────────────────────────────
+#
+# Indices into the 53-dim analyzer vector. We pull three semantic groups out
+# for the per-category scores shown in the UI. Note that the "mood" slice is
+# everything beyond the scalar features and tempo — it covers timbre (MFCCs),
+# harmonic content (chroma + tonnetz), and major/minor mode together because
+# users intuitively read all of those as part of "what a song feels like."
+
+SUBSCORE_INDICES = {
+    "tempo":  slice(0, 1),    # special-cased — gaussian on raw BPM
+    "energy": slice(1, 8),    # 7 dims of intensity/brightness features
+    "mood":   slice(8, 53),   # 45 dims: MFCCs + chroma + tonnetz + mode
+}
+
+# Weights for the overall_similarity blend. Must sum to 1.0.
+OVERALL_WEIGHTS = {
+    "tempo":  0.20,
+    "energy": 0.30,
+    "mood":   0.50,
+}
+
+# Standard deviation for the tempo gaussian (in BPM). 12 BPM is forgiving:
+# two pop songs at 118 and 124 BPM will still score ~0.88 tempo similarity.
+TEMPO_SIGMA = 12.0
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _valid_songs(songs: list[dict]) -> list[dict]:
+    """Drop songs whose audio analysis didn't produce a vector."""
+    return [s for s in songs if s.get("vector") is not None and s.get("features") is not None]
+
+
+def _user_vector(valid_songs: list[dict]) -> np.ndarray | None:
+    """The mean of all the user's song vectors. None if no valid songs."""
+    if not valid_songs:
+        return None
+    return np.mean(np.array([s["vector"] for s in valid_songs]), axis=0)
+
+
+def _user_tempo(valid_songs: list[dict]) -> float | None:
+    """Average BPM across the user's valid songs."""
+    if not valid_songs:
+        return None
+    return float(np.mean([s["features"]["tempo"] for s in valid_songs]))
+
+
+def _cosine(v1: np.ndarray, v2: np.ndarray) -> float:
+    """Cosine similarity in [-1, 1]. Returns 0 for degenerate (zero-norm) cases."""
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (n1 * n2))
+
+
+def _gaussian_sim(diff: float, sigma: float) -> float:
+    """1.0 when diff=0, decays smoothly to 0 as diff grows."""
+    return math.exp(-(diff * diff) / (2 * sigma * sigma))
+
+
+def _to_unit(cos: float) -> float:
+    """Map cosine [-1, 1] to similarity [0, 1]."""
+    return (cos + 1.0) / 2.0
+
+
+# ─── Compatibility scoring ───────────────────────────────────────────────────
 
 def compute_compatibility(songs1: list[dict], songs2: list[dict]) -> dict:
-    """
-    Original 0–100 score using Gaussian similarity on audio features.
+    """Cosine-based compatibility with energy/tempo/mood breakdown."""
+    v1_songs = _valid_songs(songs1)
+    v2_songs = _valid_songs(songs2)
 
-    Breakdown:
-      Energy  — similar loudness/intensity profiles        up to 40 pts
-      Tempo   — similar BPM preferences                    up to 30 pts
-      Mood    — similar valence (happy/sad feel)            up to 30 pts
-    """
-    # Average features for each person
-    e1 = mean([s["energy"]  for s in songs1])
-    e2 = mean([s["energy"]  for s in songs2])
-    t1 = mean([s["tempo"]   for s in songs1])
-    t2 = mean([s["tempo"]   for s in songs2])
-    v1 = mean([s["valence"] for s in songs1])
-    v2 = mean([s["valence"] for s in songs2])
+    u1 = _user_vector(v1_songs)
+    u2 = _user_vector(v2_songs)
 
-    # Gaussian similarity — ultra-strict, only true matches score high, less tight for bpm as small differences are truly not significant to human ear
-    energy_sim  = gaussian_sim(abs(e1 - e2), 0.04)
-    tempo_sim   = gaussian_sim(abs(t1 - t2), 4.0)     # 4 BPM sigma
-    valence_sim = gaussian_sim(abs(v1 - v2), 0.04)
+    if u1 is None or u2 is None:
+        return _empty_compatibility()
 
-    energy_score  = round(energy_sim  * 40)
-    tempo_score   = round(tempo_sim   * 30)
-    valence_score = round(valence_sim * 30)
+    # Subspace similarities
+    energy_cos = _cosine(u1[SUBSCORE_INDICES["energy"]],
+                         u2[SUBSCORE_INDICES["energy"]])
+    mood_cos   = _cosine(u1[SUBSCORE_INDICES["mood"]],
+                         u2[SUBSCORE_INDICES["mood"]])
 
-    total = energy_score + tempo_score + valence_score
+    energy_sim = _to_unit(energy_cos)
+    mood_sim   = _to_unit(mood_cos)
 
-    # ── Vibe labels based on feature averages ──
-    def vibe_label(energy, tempo, valence):
-        labels = []
-        if energy > 0.65:
-            labels.append("High Energy")
-        elif energy < 0.35:
-            labels.append("Chill")
-        else:
-            labels.append("Moderate")
+    # Tempo: gaussian on actual BPM averages
+    t1 = _user_tempo(v1_songs)
+    t2 = _user_tempo(v2_songs)
+    tempo_sim = _gaussian_sim(abs(t1 - t2), TEMPO_SIGMA)
 
-        if tempo > 130:
-            labels.append("Fast-Paced")
-        elif tempo < 90:
-            labels.append("Slow-Paced")
+    overall = (
+        OVERALL_WEIGHTS["energy"] * energy_sim
+        + OVERALL_WEIGHTS["tempo"]  * tempo_sim
+        + OVERALL_WEIGHTS["mood"]   * mood_sim
+    )
+    overall_score = round(overall * 100)
 
-        if valence > 0.6:
-            labels.append("Upbeat")
-        elif valence < 0.4:
-            labels.append("Moody")
-        else:
-            labels.append("Balanced")
-
-        return " / ".join(labels)
+    energy_score = round(energy_sim * 40)
+    tempo_score  = round(tempo_sim  * 30)
+    mood_score   = round(mood_sim   * 30)
 
     return {
-        "total":         min(total, 100),
-        "energy_score":  energy_score,
-        "tempo_score":   tempo_score,
-        "valence_score": valence_score,
-        "vibe1":         vibe_label(e1, t1, v1),
-        "vibe2":         vibe_label(e2, t2, v2),
+        "total":              overall_score,
+        "overall_similarity": overall_score,
+        "energy_score":       energy_score,
+        "tempo_score":        tempo_score,
+        "mood_score":         mood_score,
+        "vibe1":              _vibe_label(v1_songs),
+        "vibe2":              _vibe_label(v2_songs),
         "details": {
-            "avg_energy_1":  round(e1, 3),
-            "avg_energy_2":  round(e2, 3),
-            "avg_tempo_1":   round(t1, 1),
-            "avg_tempo_2":   round(t2, 1),
-            "avg_valence_1": round(v1, 3),
-            "avg_valence_2": round(v2, 3),
+            "tempo1_bpm":     round(t1, 1),
+            "tempo2_bpm":     round(t2, 1),
+            "energy_cosine":  round(energy_cos, 3),
+            "mood_cosine":    round(mood_cos,   3),
+            "valid_count_1":  len(v1_songs),
+            "valid_count_2":  len(v2_songs),
         },
     }
+
+
+def _empty_compatibility() -> dict:
+    return {
+        "total":              0,
+        "overall_similarity": 0,
+        "energy_score":       0,
+        "tempo_score":        0,
+        "mood_score":         0,
+        "vibe1":              "Unknown",
+        "vibe2":              "Unknown",
+        "details":            {},
+    }
+
 
 def compatibility_message(score: int) -> str:
     if score >= 85: return "Soulmates 🎵 You were made for the same playlist."
@@ -87,169 +173,169 @@ def compatibility_message(score: int) -> str:
     if score >= 25: return "Different worlds. But opposites attract, right?"
     return "Complete opposites. Take turns on the aux — no fighting."
 
+
+# ─── Vibe labels ─────────────────────────────────────────────────────────────
+
+def _vibe_label(valid_songs: list[dict]) -> str:
+    """Generate a short descriptive label from real audio averages."""
+    if not valid_songs:
+        return "Unknown"
+
+    feats = [s["features"] for s in valid_songs]
+    avg_tempo    = float(np.mean([f["tempo"]         for f in feats]))
+    avg_rms      = float(np.mean([f["rms_mean"]      for f in feats]))
+    avg_centroid = float(np.mean([f["centroid_mean"] for f in feats]))
+    avg_mode     = float(np.mean([f["mode"]          for f in feats]))
+
+    parts = []
+
+    if   avg_rms > 0.15: parts.append("High Energy")
+    elif avg_rms < 0.06: parts.append("Chill")
+    else:                parts.append("Moderate")
+
+    if   avg_tempo > 130: parts.append("Fast-Paced")
+    elif avg_tempo < 90:  parts.append("Slow-Paced")
+
+    if   avg_centroid > 3500: parts.append("Bright")
+    elif avg_centroid < 1800: parts.append("Warm")
+
+    if   avg_mode > 0.66: parts.append("Upbeat")
+    elif avg_mode < 0.34: parts.append("Moody")
+    else:                 parts.append("Balanced")
+
+    return " / ".join(parts)
+
+
+# ─── Vector-pool matrix (in-process cache of all cached song vectors) ───────
+#
+# Recommendations work by computing cosine similarity between the midpoint
+# vector and EVERY cached song's vector. Pulling thousands of rows from
+# Postgres on every request would be wasteful, so we load them once into a
+# numpy matrix kept in memory, refresh on a TTL, and do the cosine
+# computation as one vectorized matrix multiply.
+
+_vector_matrix: np.ndarray | None = None  # shape (N, 53), float32
+_vector_norms:  np.ndarray | None = None  # shape (N,), precomputed for cosine
+_vector_meta:   list[dict] = []           # parallel row metadata
+_matrix_loaded_at: float = 0.0
+_matrix_lock = asyncio.Lock()
+
+# How long the in-memory matrix is considered fresh. After this, the next
+# recommendation request triggers a reload from Postgres. The pool grows
+# in the background (via prewarm and live user queries), so a few-minute
+# TTL is enough to keep the recommender working with recent additions.
+MATRIX_TTL_SECONDS = 300  # 5 minutes
+
+
+async def _ensure_vector_matrix() -> None:
+    """Load (or refresh) the in-memory matrix of all cached vectors."""
+    global _vector_matrix, _vector_norms, _vector_meta, _matrix_loaded_at
+
+    now = time.time()
+    if _vector_matrix is not None and (now - _matrix_loaded_at) < MATRIX_TTL_SECONDS:
+        return
+
+    async with _matrix_lock:
+        # Re-check inside the lock — another caller may have just loaded.
+        now = time.time()
+        if _vector_matrix is not None and (now - _matrix_loaded_at) < MATRIX_TTL_SECONDS:
+            return
+
+        entries = await cache.get_all_cached()
+
+        if not entries:
+            _vector_matrix = np.zeros((0, analyzer.VECTOR_DIM), dtype=np.float32)
+            _vector_norms  = np.zeros((0,), dtype=np.float32)
+            _vector_meta   = []
+        else:
+            _vector_matrix = np.array(
+                [e["vector"] for e in entries], dtype=np.float32,
+            )
+            _vector_norms = np.linalg.norm(_vector_matrix, axis=1)
+            _vector_meta  = entries
+
+        _matrix_loaded_at = now
+
+
+# ─── Midpoint nearest-neighbor recommendations ──────────────────────────────
+
 async def get_recommendations(songs1: list[dict], songs2: list[dict]) -> list[dict]:
+    """Recommend songs whose audio fingerprint sits near the midpoint of the
+    two users' fingerprints, drawn from the entire cached pool.
+
+    Returns up to 6 unique-artist recommendations (track name, artist, image,
+    Deezer URL). Excludes any song or artist that appeared in the user inputs.
+
+    Returns an empty list if the cache is empty or if neither user has any
+    analyzable songs.
     """
-    Find 6 NEW song recommendations matched by audio characteristics.
-
-    For each person:
-      1. Compute their average audio profile (energy, tempo, valence)
-      2. Discover related artists via Deezer
-      3. Get candidate tracks and enrich them with librosa
-      4. Rank candidates by how close their features are to the person's average
-      5. Pick the top 3 closest matches
-
-    Returns 6 songs, alternating: P1, P2, P1, P2, P1, P2
-    """
-    # ── Step 1: Compute average audio profiles from already-enriched songs ──
-    avg1 = {
-        "energy":  mean([s["energy"]  for s in songs1]),
-        "tempo":   mean([s["tempo"]   for s in songs1]),
-        "valence": mean([s["valence"] for s in songs1]),
-    }
-    avg2 = {
-        "energy":  mean([s["energy"]  for s in songs2]),
-        "tempo":   mean([s["tempo"]   for s in songs2]),
-        "valence": mean([s["valence"] for s in songs2]),
-    }
-
-    # IDs to exclude: input songs + input artists
-    existing_track_ids = {s["track_id"] for s in songs1 + songs2}
-    existing_artist_ids = {s.get("artist_id", "") for s in songs1 + songs2}
-
-    def unique_artist_ids(songs):
-        seen, result = set(), []
-        for s in songs:
-            aid = s.get("artist_id", "")
-            if aid and aid not in seen:
-                seen.add(aid)
-                result.append(aid)
-        return result
-
-    artist_ids1 = unique_artist_ids(songs1)
-    artist_ids2 = unique_artist_ids(songs2)
-
-    # ── Step 2: Discover related artists via Deezer ──
-    async def fetch_related(artist_id: str):
-        try:
-            r = await client.http_client.get(
-                f"https://api.deezer.com/artist/{artist_id}/related",
-                params={"limit": 5}
-            )
-            if r.status_code == 200:
-                return r.json().get("data", [])
-        except Exception:
-            pass
+    v1_songs = _valid_songs(songs1)
+    v2_songs = _valid_songs(songs2)
+    u1 = _user_vector(v1_songs)
+    u2 = _user_vector(v2_songs)
+    if u1 is None or u2 is None:
         return []
 
-    all_ids = artist_ids1 + artist_ids2
-    related_batches = await asyncio.gather(*[
-        fetch_related(aid) for aid in all_ids
-    ])
-
-    # Build pools of NEW related artists (exclude ones already in input)
-    def build_new_pool(batches):
-        seen, pool = set(), []
-        for batch in batches:
-            for a in batch:
-                aid = str(a.get("id", ""))
-                if aid and aid not in existing_artist_ids and aid not in seen:
-                    seen.add(aid)
-                    pool.append(aid)
-        return pool
-
-    new_artist_ids1 = build_new_pool(related_batches[:len(artist_ids1)])[:3]
-    new_artist_ids2 = build_new_pool(related_batches[len(artist_ids1):])[:3]
-
-    # ── Step 3: Get top tracks from related artists ──
-    async def fetch_top_tracks(artist_id: str, limit: int = 3):
-        try:
-            r = await client.http_client.get(
-                f"https://api.deezer.com/artist/{artist_id}/top",
-                params={"limit": limit}
-            )
-            if r.status_code == 200:
-                return r.json().get("data", [])
-        except Exception:
-            pass
+    # The midpoint = the geometric center between two users' tastes. Songs
+    # near here are the "sonic intersection" of what they each individually
+    # like — by construction, they should appeal to both.
+    midpoint = ((u1 + u2) / 2.0).astype(np.float32)
+    midpoint_norm = float(np.linalg.norm(midpoint))
+    if midpoint_norm == 0.0:
         return []
 
-    all_new_ids = new_artist_ids1 + new_artist_ids2
-    track_batches = await asyncio.gather(*[
-        fetch_top_tracks(aid, limit=1) for aid in all_new_ids
-    ])
+    # Load (or refresh) the in-memory matrix.
+    await _ensure_vector_matrix()
+    if _vector_matrix is None or _vector_matrix.shape[0] == 0:
+        return []
 
-    # Build candidate track dicts (formatted for enrich_track)
-    def build_candidates(batches):
-        seen, candidates = set(), []
-        for batch in batches:
-            for t in batch:
-                tid = str(t.get("id", ""))
-                if tid and tid not in existing_track_ids and tid not in seen:
-                    seen.add(tid)
-                    artist = t.get("artist", {})
-                    album = t.get("album", {})
-                    candidates.append({
-                        "name":      t.get("title", ""),
-                        "artist":    artist.get("name", ""),
-                        "artist_id": str(artist.get("id", "")),
-                        "track_id":  tid,
-                        "deezer_id": t.get("id"),
-                        "image":     album.get("cover_medium", "") or album.get("cover_big", ""),
-                        "url":       t.get("link", ""),
-                        "preview":   t.get("preview", ""),
-                    })
-        return candidates
+    # Vectorized cosine similarity:
+    #   sim_i = (matrix[i] · midpoint) / (||matrix[i]|| · ||midpoint||)
+    # One matrix-vector multiply, one elementwise divide, done.
+    dots = _vector_matrix @ midpoint
+    denom = (_vector_norms * midpoint_norm) + 1e-9
+    similarities = dots / denom
 
-    candidates1 = build_candidates(track_batches[:len(new_artist_ids1)])[:6]
-    candidates2 = build_candidates(track_batches[len(new_artist_ids1):])[:6]
+    # Exclusion sets — don't recommend songs/artists the user already typed.
+    exclude_track_ids: set[str] = set()
+    exclude_artist_ids: set[str] = set()
+    for s in songs1 + songs2:
+        if s.get("track_id"):  exclude_track_ids.add(str(s["track_id"]))
+        if s.get("deezer_id"): exclude_track_ids.add(str(s["deezer_id"]))
+        if s.get("artist_id"): exclude_artist_ids.add(str(s["artist_id"]))
 
-    # ── Step 4: Enrich candidates with librosa (energy, tempo, valence) ──
-    all_candidates = candidates1 + candidates2
-    enriched_all = await asyncio.gather(*[
-        enrich_track(c) for c in all_candidates
-    ])
-    enriched1 = enriched_all[:len(candidates1)]
-    enriched2 = enriched_all[len(candidates1):]
+    # Walk sorted indices (highest similarity first), pick first 6 that
+    # pass the filters AND have a unique artist.
+    order = np.argsort(-similarities)
 
-    # ── Step 5: Rank by feature similarity to the person's average ──
-    def feature_distance(track, avg): # use gaussian math for both comparing songs from each list and for finding new songs, which i will focus on explaining
-        """Weighted distance: energy and valence on 0-1 scale, tempo normalized."""
-        e_diff = abs(track.get("energy", 0.5) - avg["energy"])
-        t_diff = abs(track.get("tempo", 120) - avg["tempo"]) / 200.0
-        v_diff = abs(track.get("valence", 0.5) - avg["valence"])
-        # Weight: energy 35%, tempo 35%, valence 30%
-        return e_diff * 0.35 + t_diff * 0.35 + v_diff * 0.30
+    final: list[dict] = []
+    used_artists: set[str] = set()
+    for idx in order:
+        sim = float(similarities[idx])
+        if sim <= 0.0:
+            break  # cosine ≤ 0 means the song is no more similar than random
 
-    scored1 = sorted(enriched1, key=lambda t: feature_distance(t, avg1))
-    scored2 = sorted(enriched2, key=lambda t: feature_distance(t, avg2))
+        entry     = _vector_meta[int(idx)]
+        deezer_id = str(entry.get("deezer_id") or "")
+        artist_id = str(entry.get("artist_id") or "")
 
-    # Pick top 3 per person (unique artists only)
-    def pick_top(scored, n=3):
-        result, used_artists = [], set()
-        for t in scored:
-            aid = t.get("artist_id", "")
-            if aid in used_artists:
-                continue
-            result.append({
-                "name":   t["name"],
-                "artist": t["artist"],
-                "image":  t.get("image", ""),
-                "url":    t.get("url", ""),
-            })
-            used_artists.add(aid)
-            if len(result) >= n:
-                break
-        return result
+        if deezer_id and deezer_id in exclude_track_ids:
+            continue
+        if artist_id and artist_id in exclude_artist_ids:
+            continue
+        if artist_id and artist_id in used_artists:
+            continue
 
-    top1 = pick_top(scored1, 3)
-    top2 = pick_top(scored2, 3)
+        final.append({
+            "name":   entry.get("track_name")  or "",
+            "artist": entry.get("artist_name") or "",
+            "image":  entry.get("track_image") or "",
+            "url":    entry.get("track_url")   or "",
+        })
+        if artist_id:
+            used_artists.add(artist_id)
 
-    # ── Step 6: Interleave P1, P2, P1, P2, P1, P2 ──
-    final = []
-    for i in range(3):
-        if i < len(top1):
-            final.append(top1[i])
-        if i < len(top2):
-            final.append(top2[i])
+        if len(final) >= 6:
+            break
 
     return final

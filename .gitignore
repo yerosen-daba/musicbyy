@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Environment / secrets (e.g. DATABASE_URL with the Supabase password)
+.env
+.env.local
+*.env

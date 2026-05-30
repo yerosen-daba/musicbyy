@@ -2,3 +2,13 @@ fastapi==0.103.1
 uvicorn==0.23.2
 httpx==0.25.0
 pydantic==2.3.0
+
+# ── Audio analysis ──────────────────────────────────────────────────────────
+librosa==0.10.2.post1
+numpy==1.26.4
+scipy==1.13.1
+soundfile==0.12.1
+audioread==3.0.1
+
+# ── Postgres connection for the feature cache (Supabase) ───────────────────
+asyncpg==0.29.0
