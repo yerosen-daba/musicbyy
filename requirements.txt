@@ -1,14 +1,17 @@
-fastapi==0.103.1
-uvicorn==0.23.2
-httpx==0.25.0
-pydantic==2.3.0
+fastapi==0.115.6
+uvicorn==0.32.1
+httpx==0.27.2
+pydantic==2.10.4
 
 # ── Audio analysis ──────────────────────────────────────────────────────────
-librosa==0.10.2.post1
-numpy==1.26.4
-scipy==1.13.1
+# These versions all have pre-built wheels for Python 3.11 (Docker) AND
+# Python 3.13 (typical local install) on Apple Silicon + Linux x86_64, so
+# `pip install -r requirements.txt` works without needing a Fortran compiler.
+librosa==0.11.0
+numpy==2.1.3
+scipy==1.14.1
 soundfile==0.12.1
 audioread==3.0.1
 
 # ── Postgres connection for the feature cache (Supabase) ───────────────────
-asyncpg==0.29.0
+asyncpg==0.30.0
