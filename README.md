@@ -1,68 +1,92 @@
 # Music Byy
 
-**Music Byy** (formerly known as Music Match) is a full-stack web application designed to calculate the musical "vibe" compatibility between two users based on their favorite songs. 
+A music discovery tool framed as a compatibility check.
 
-Unlike standard matching algorithms that rely heavily on explicit genre tags, Music Byy calculates compatibility by dynamically fetching and comparing metadata across three core acoustic characteristics:
-1. **Energy (Popularity/Rank Proxy)**: Evaluates if both users prefer mainstream hits or underground/niche music.
-2. **Tempo (BPM)**: Calculates the average tempo of the user's favorite tracks to determine if they prefer upbeat or relaxed music.
-3. **Valence (Release Era Proxy)**: Evaluates the release year of the tracks to determine if the users have similar tastes in classic vs. modern music.
+Two people type a few of their favorite songs each. The backend downloads the 30-second previews, runs real Fourier-based audio analysis to fingerprint each song in a 53-dimensional feature space, and computes a compatibility score from the cosine similarity of the two listeners' average fingerprints. The actual product is the recommendation engine that sits underneath: it searches a cache of thousands of pre-analyzed songs and returns the ones whose audio fingerprints sit closest to the **geometric midpoint** of the two listeners — the sonic intersection of their tastes, almost always songs neither of them has heard.
 
-After computing a Gaussian mathematical similarity score, the engine fetches related artists from the Deezer API and securely interleaves 6 new song recommendations for the users to enjoy together.
+Live at **[musicbyy.com](https://musicbyy.com)**.
 
-## Setup & Running the Code
+## How it works
 
-The backend is built with **FastAPI** in Python, and the frontend is built using standard **HTML/CSS/Vanilla JavaScript**. The project is designed to be entirely self-contained and **does not require any personal API keys** (it relies on Deezer's public, unauthenticated API).
+**Each song gets a real audio fingerprint.** When a song comes in for the first time, the backend hits Deezer for its 30-second preview MP3 (with iTunes Search API as a fallback for tracks Deezer doesn't have a preview for). librosa loads the audio at 22 kHz mono and extracts:
 
-### Prerequisites
-- Python 3.9+
-- A modern web browser
+- **Tempo** via beat tracking
+- **Energy** from RMS amplitude, spectral centroid, rolloff, bandwidth, and zero-crossing rate
+- **Timbre** as 13 MFCC means and standard deviations
+- **Harmonic content** as 12 chroma values and 6 tonnetz components
+- **Mode** (major vs. minor) via Krumhansl-Kessler key profile correlation
 
-### Running Locally
-1. Clone the repository to your local machine.
-2. Navigate to the project directory:
-   ```bash
-   cd music-match
-   ```
-3. Install the lightweight Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Start the FastAPI backend server:
-   ```bash
-   uvicorn app:app --reload
-   ```
-   *The server will start on `http://localhost:8000`.*
-5. Open the `index.html` file in any web browser to view the frontend interface. It will automatically connect to your local backend.
+These features are normalized and packed into a 53-dim vector that uniquely represents how the song sounds. The vector is written to a Supabase Postgres cache — so the song is never analyzed twice across the entire history of the deployment.
 
-### Deployment Architecture
-The live version of this app is deployed as follows:
-- **Backend**: Hosted as a Dockerized web service on Render (Starter Tier).
-- **Frontend**: Hosted statically via GitHub Pages and mapped to a custom domain (`musicbyy.com`).
+**Each user's "musical fingerprint" is the average of their songs' vectors.** Compatibility is the weighted blend of three subspace cosine similarities:
 
----
+- **Energy** (cosine on the 7 intensity dims) — 30% weight
+- **Tempo** (gaussian on raw BPM averages) — 20% weight  
+- **Mood** (cosine on the 45 timbre/harmonic/mode dims) — 50% weight
 
-## File Structure
+Scaled to 0–100. A subscore breakdown is surfaced in the UI.
 
-- `app.py`: The main FastAPI server entry point and API router.
-- `client.py`: A singleton managing asynchronous HTTP connections (via `httpx`).
-- `deezer.py`: Handles all interactions with the Deezer API (fetching track metadata and relationships).
-- `match.py`: The core algorithm engine. Contains the complex Gaussian math that scores compatibility and generates the final recommendation list.
-- `index.html`: The fully responsive, vanilla frontend user interface.
-- `Dockerfile`: Configuration for deploying the backend environment.
+**Recommendations come from nearest-neighbor search in audio-feature space.** The recommender computes the midpoint vector between the two users, loads every cached song vector into a numpy matrix (refreshed every 5 minutes), and ranks the full pool by cosine similarity to the midpoint. The top 6 with unique artists, excluding the input songs, are returned. The bigger the cache, the richer the discovery — quality scales with the size of the pre-warmed pool.
 
----
+## Why this is different from Spotify Blend
 
-## Citations & External Contributions
+Existing two-user compatibility tools (Spotify Blend, MusicTaste.space, etc.) use **collaborative filtering** on listening history — "people whose play patterns look like yours also play X." That requires a streaming-platform account, weeks of listening data, and access to a recommendation engine trained on millions of users.
 
-### Code Sources & Dependencies
-- **FastAPI Framework**: Used for building the backend REST API quickly and asynchronously ([Link](https://fastapi.tiangolo.com/)).
-- **Deezer API**: All track search, artist relationship mapping, and metadata fetching are powered by the public Deezer API ([Link](https://developers.deezer.com/api)).
+Music Byy uses **content-based audio analysis** — "song X sounds acoustically similar to your shared midpoint." It works for anyone who can name 5 songs, on any platform, with no listening history required. No login. Cross-platform. And because the fingerprints come from raw signal analysis, the algorithm can surface genuinely surprising recommendations across genres that collaborative-filter engines wouldn't connect.
 
-### Generative AI Usage
-I extensively used **Antigravity** (a generative AI pair-programming assistant powered by Google DeepMind) throughout the development of this project to assist with architecture, math optimization, and deployment.
+## Tech stack
 
-Specifically, the AI was used to:
-1. **Refactor the Codebase**: The initial prototype was a single monolithic Python script. I used the AI to help me split the codebase into a clean, modular structure (`app.py`, `deezer.py`, `match.py`) to improve maintainability.
-2. **Optimize the Mathematical Engine**: The Gaussian compatibility scoring formula in `match.py` (specifically `compute_compatibility`) was generated in collaboration with the AI. We iterated on the standard deviation (`sigma`) values to correctly scale the differences in BPM and Release Years so that the scores were balanced and realistic.
-3. **Deployment Troubleshooting**: The backend originally relied on `librosa` for deep audio waveform analysis. However, downloading and processing MP3 files caused severe "Out of Memory" crashes and 30-second timeouts on the Render cloud host. The AI analyzed the server error logs and helped me rewrite the engine to bypass audio downloading entirely, using metadata proxies (Rank, BPM, Year) instead, which reduced API response times from ~39 seconds to ~1.3 seconds.
-4. **CSS Animations**: The complex pulsing animations and dynamic visual layout of the `index.html` frontend were generated using the AI, which provided the vanilla CSS keyframes to achieve the "glassmorphism" design aesthetic.
+| Layer | What it is |
+| --- | --- |
+| Frontend | Vanilla HTML / CSS / JS, hosted on GitHub Pages |
+| Backend | FastAPI on Render |
+| Audio analysis | librosa + numpy + scipy |
+| Cache / metadata store | Supabase Postgres via asyncpg |
+| Music data sources | Deezer Public API (primary), iTunes Search API (fallback) |
+
+## Project structure
+
+```
+app.py          FastAPI entry point, route handlers, lifespan
+analyzer.py     librosa-based audio feature extraction + vector packing
+deezer.py       Deezer search + cache-first track enrichment
+itunes.py       iTunes Search API fallback for missing previews
+match.py        Compatibility scoring + midpoint nearest-neighbor recommendations
+cache.py        Supabase Postgres feature cache (async via asyncpg)
+client.py       Shared httpx async client singleton
+prewarm.py      One-shot script that walks Deezer's genres and fills the cache
+index.html      The entire frontend in one file
+Dockerfile      Render's build instructions (installs ffmpeg + librosa deps)
+requirements.txt Python deps pinned to Python 3.11 + 3.13 compatible versions
+CNAME           GitHub Pages custom domain (musicbyy.com)
+```
+
+## Running locally
+
+Prerequisites: Python 3.11+ and a Supabase Postgres project for the feature cache.
+
+```bash
+git clone https://github.com/yerosen-daba/musicbyy.git
+cd musicbyy
+pip install -r requirements.txt
+export DATABASE_URL="postgresql://postgres.<project-id>:<password>@aws-1-us-east-2.pooler.supabase.com:5432/postgres"
+uvicorn app:app --reload --port 8000
+```
+
+Then open `index.html` in your browser. The frontend's `API` constant points at the live Render service by default — change it to `http://localhost:8000` for fully local development.
+
+### Pre-warming the cache
+
+The midpoint recommender draws candidates entirely from the cache, so a populated cache is what makes recommendations rich. Run once after deploying:
+
+```bash
+python3 prewarm.py --tracks 5000 --concurrency 4
+```
+
+This walks Deezer's full genre list, pulls top tracks per genre, and writes their feature vectors to Supabase. Roughly 1 second per track. Already-cached tracks are skipped on re-runs.
+
+## Credits
+
+The original prototype was built as a CS course project using metadata proxies (popularity rank, release year) as stand-ins for energy and mood. The current architecture — real Fourier-based audio analysis, Supabase-backed feature cache, midpoint nearest-neighbor recommendations, and the refreshed frontend — was developed in collaboration with Claude (Anthropic) over an extended pair-programming session.
+
+Music data is provided by the Deezer Public API and the iTunes Search API.
