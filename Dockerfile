@@ -24,4 +24,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Run the FastAPI server.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
+# Port 7860 is Hugging Face Spaces' default Docker port. Render uses this
+# value via the $PORT env var, so the same image runs on either platform.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
