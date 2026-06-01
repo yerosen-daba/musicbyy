@@ -1,3 +1,13 @@
+---
+title: Music Byy
+emoji: 🎵
+colorFrom: blue
+colorTo: pink
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Music Byy
 
 A music discovery tool framed as a compatibility check.
