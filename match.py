@@ -50,9 +50,21 @@ OVERALL_WEIGHTS = {
     "mood":   0.50,
 }
 
-# Standard deviation for the tempo gaussian (in BPM). 12 BPM is forgiving:
-# two pop songs at 118 and 124 BPM will still score ~0.88 tempo similarity.
-TEMPO_SIGMA = 12.0
+# Standard deviation for the tempo gaussian (in BPM). 8 BPM is strict:
+# two songs at 118 and 124 BPM will score ~0.83 tempo similarity, two
+# songs at 100 and 130 BPM will score ~0.04 (basically zero).
+TEMPO_SIGMA = 8.0
+
+# Empirical baseline cosine between two random music feature vectors.
+# Real-music vectors share lots of structure (MFCC offsets, mode bits,
+# similar production), so the floor of "how unlike each other can these
+# vectors look" is around 0.65–0.75, not 0. We use this baseline to
+# rescale similarity so the percentage means something:
+#   cosine == baseline → 0% similar (two unrelated songs, not "50% similar")
+#   cosine == 1.0      → 100% similar (identical fingerprint)
+# Without this rescaling, two totally different genres can still come out
+# as 90%+ similar, which makes every match feel like a soulmate match.
+COSINE_BASELINE = 0.70
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -91,8 +103,16 @@ def _gaussian_sim(diff: float, sigma: float) -> float:
 
 
 def _to_unit(cos: float) -> float:
-    """Map cosine [-1, 1] to similarity [0, 1]."""
-    return (cos + 1.0) / 2.0
+    """Map cosine similarity to a [0, 1] perceptual-similarity value.
+
+    Rescales relative to the empirical baseline cosine between random
+    music vectors (≈0.70), so the percentage reflects "how unusually
+    similar" rather than the raw geometric overlap. Two unrelated songs
+    end up near 0% instead of 50%.
+    """
+    if cos <= COSINE_BASELINE:
+        return 0.0
+    return min(1.0, (cos - COSINE_BASELINE) / (1.0 - COSINE_BASELINE))
 
 
 # ─── Compatibility scoring ───────────────────────────────────────────────────
