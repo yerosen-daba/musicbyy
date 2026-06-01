@@ -11,26 +11,26 @@
 
   <style>
     :root {
-      /* Warm off-white base with a hint of cream for easier readability */
-      --bg: #fafaf7;
-      --bg-tint-1: #f4eef9;
-      --bg-tint-2: #fef0f4;
+      /* Clean white base with cool ocean undertone */
+      --bg: #fbfdfe;
+      --bg-tint-1: #e6f3f8;
+      --bg-tint-2: #fff0e9;
       --surface: #ffffff;
-      --surface-alt: #f7f5fa;
-      --border: #e8e6f0;
-      --border-strong: #d6d2e4;
+      --surface-alt: #f3f8fb;
+      --border: #dfeaf0;
+      --border-strong: #c5d6e0;
 
-      /* Refined purple + coral pair — feels modern and "musical" */
-      --primary: #6b5bff;
-      --primary-dark: #5444e8;
-      --primary-soft: #ede9ff;
-      --secondary: #ff6b8a;
-      --secondary-soft: #ffe5ec;
+      /* Ocean blue + warm coral — tropical sunset on water */
+      --primary: #0f8ab5;
+      --primary-dark: #086a8e;
+      --primary-soft: #dbeff7;
+      --secondary: #ff7e6b;
+      --secondary-soft: #ffe7e1;
 
       /* Type */
-      --text: #1a1a2e;
-      --text-soft: #4b4d63;
-      --muted: #8a8ba0;
+      --text: #102a3a;
+      --text-soft: #3f5666;
+      --muted: #7a8b97;
       --mono: 'DM Mono', monospace;
       --sans: 'Inter', system-ui, -apple-system, sans-serif;
       --display: 'Syne', sans-serif;
@@ -108,7 +108,7 @@
       height: 6px;
       border-radius: 50%;
       background: var(--primary);
-      box-shadow: 0 0 0 4px rgba(107, 91, 255, 0.18);
+      box-shadow: 0 0 0 4px rgba(15, 138, 181, 0.18);
     }
 
     .header h1 {
@@ -190,7 +190,7 @@
     }
 
     .person2 .card-badge {
-      background: linear-gradient(135deg, var(--secondary) 0%, #e85675 100%);
+      background: linear-gradient(135deg, var(--secondary) 0%, #e85a47 100%);
     }
 
     .card-label {
@@ -220,7 +220,7 @@
     .name-input:focus {
       background: var(--surface);
       border-color: var(--primary);
-      box-shadow: 0 0 0 4px rgba(107, 91, 255, 0.12);
+      box-shadow: 0 0 0 4px rgba(15, 138, 181, 0.12);
     }
 
     .name-input::placeholder {
@@ -266,7 +266,7 @@
     .song-input:focus {
       background: var(--surface);
       border-color: var(--primary);
-      box-shadow: 0 0 0 3px rgba(107, 91, 255, 0.10);
+      box-shadow: 0 0 0 3px rgba(15, 138, 181, 0.10);
     }
 
     .song-input::placeholder {
@@ -375,12 +375,12 @@
       letter-spacing: 0.02em;
       cursor: pointer;
       transition: transform 0.15s, box-shadow 0.2s;
-      box-shadow: 0 8px 24px rgba(107, 91, 255, 0.28);
+      box-shadow: 0 8px 24px rgba(15, 138, 181, 0.28);
     }
 
     .match-btn:hover {
       transform: translateY(-1px);
-      box-shadow: 0 12px 28px rgba(107, 91, 255, 0.36);
+      box-shadow: 0 12px 28px rgba(15, 138, 181, 0.36);
     }
 
     .match-btn:active {
@@ -411,7 +411,7 @@
 
     .dot:nth-child(2) {
       animation-delay: .15s;
-      background: #a094ff;
+      background: #5bb8d4;
     }
 
     .dot:nth-child(3) {
@@ -470,8 +470,8 @@
       width: 520px;
       height: 360px;
       background:
-        radial-gradient(ellipse, rgba(107, 91, 255, 0.18) 0%, transparent 60%),
-        radial-gradient(ellipse, rgba(255, 107, 138, 0.14) 30%, transparent 65%);
+        radial-gradient(ellipse, rgba(15, 138, 181, 0.18) 0%, transparent 60%),
+        radial-gradient(ellipse, rgba(255, 126, 107, 0.16) 30%, transparent 65%);
       pointer-events: none;
       filter: blur(8px);
     }
@@ -590,12 +590,12 @@
 
     .vibe-card.p1 {
       background: linear-gradient(135deg, var(--surface) 0%, var(--primary-soft) 100%);
-      border-color: rgba(107, 91, 255, 0.25);
+      border-color: rgba(15, 138, 181, 0.25);
     }
 
     .vibe-card.p2 {
       background: linear-gradient(135deg, var(--surface) 0%, var(--secondary-soft) 100%);
-      border-color: rgba(255, 107, 138, 0.25);
+      border-color: rgba(255, 126, 107, 0.25);
     }
 
     .vibe-name {
@@ -784,8 +784,8 @@
 
     .error-msg {
       background: var(--secondary-soft);
-      border: 1px solid rgba(255, 107, 138, 0.3);
-      color: #b1374f;
+      border: 1px solid rgba(255, 126, 107, 0.35);
+      color: #b8493a;
       font-size: 14px;
       font-weight: 500;
       text-align: center;
