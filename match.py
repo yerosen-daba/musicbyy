@@ -50,21 +50,24 @@ OVERALL_WEIGHTS = {
     "mood":   0.50,
 }
 
-# Standard deviation for the tempo gaussian (in BPM). 8 BPM is strict:
-# two songs at 118 and 124 BPM will score ~0.83 tempo similarity, two
-# songs at 100 and 130 BPM will score ~0.04 (basically zero).
-TEMPO_SIGMA = 8.0
+# Standard deviation for the tempo gaussian (in BPM). 5 BPM is strict:
+# two songs at 118 and 124 BPM score ~0.49 tempo similarity, two songs
+# at 100 and 130 BPM score ~0.0 (basically zero).
+TEMPO_SIGMA = 5.0
 
-# Empirical baseline cosine between two random music feature vectors.
-# Real-music vectors share lots of structure (MFCC offsets, mode bits,
-# similar production), so the floor of "how unlike each other can these
-# vectors look" is around 0.65–0.75, not 0. We use this baseline to
-# rescale similarity so the percentage means something:
-#   cosine == baseline → 0% similar (two unrelated songs, not "50% similar")
+# Empirical baseline cosine between two random user-mean vectors.
+# When we average a user's songs into a single vector, the mean tends to
+# land near the center of feature space — so two random users start
+# at a cosine baseline closer to ~0.85 than 0 due to convergence.
+# We rescale relative to this baseline so the percentage feels right:
+#   cosine == baseline → 0% similar (random pair, not "85% similar")
 #   cosine == 1.0      → 100% similar (identical fingerprint)
-# Without this rescaling, two totally different genres can still come out
-# as 90%+ similar, which makes every match feel like a soulmate match.
-COSINE_BASELINE = 0.70
+COSINE_BASELINE = 0.88
+
+# Power exponent applied after baseline rescaling. >1 compresses high
+# similarities downward, making "looks 90% the same" require genuinely
+# being 90% the same instead of just sharing baseline structure.
+SIMILARITY_POWER = 2.0
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -105,14 +108,21 @@ def _gaussian_sim(diff: float, sigma: float) -> float:
 def _to_unit(cos: float) -> float:
     """Map cosine similarity to a [0, 1] perceptual-similarity value.
 
-    Rescales relative to the empirical baseline cosine between random
-    music vectors (≈0.70), so the percentage reflects "how unusually
-    similar" rather than the raw geometric overlap. Two unrelated songs
-    end up near 0% instead of 50%.
+    Two stages:
+      1. Linear rescale relative to the empirical baseline (cosine 0.88 → 0,
+         cosine 1.0 → 1). Two random user vectors end up near 0% instead of
+         85%, which is what cosine on convergent mean vectors does naturally.
+      2. Power transform: raise to SIMILARITY_POWER. This compresses high
+         values down, so "looks 90% the same" requires genuinely being 90%
+         the same instead of just sharing baseline music structure.
+
+    Net effect: scoring is sharply discriminating. Mainstream-pop vs.
+    hip-hop should land in the 50–70 range, not the 90s.
     """
     if cos <= COSINE_BASELINE:
         return 0.0
-    return min(1.0, (cos - COSINE_BASELINE) / (1.0 - COSINE_BASELINE))
+    rescaled = (cos - COSINE_BASELINE) / (1.0 - COSINE_BASELINE)
+    return min(1.0, rescaled) ** SIMILARITY_POWER
 
 
 # ─── Compatibility scoring ───────────────────────────────────────────────────
