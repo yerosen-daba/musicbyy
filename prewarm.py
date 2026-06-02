@@ -1,22 +1,24 @@
 """
-prewarm.py — One-shot script to populate the feature cache with a broad pool
-of analyzed songs.
+prewarm.py — One-shot script to populate the feature cache with a broad,
+diverse pool of analyzed songs.
 
 The midpoint-search recommender draws candidates exclusively from the cache,
-so the cache size directly determines how rich the recommendations can be.
-This script seeds the cache by walking every Deezer genre (including
-sub-genres) and analyzing each genre's top tracks. With default settings it
-produces a pool of roughly 5,000–10,000 unique songs.
+so cache size + diversity directly determines how good recommendations are.
+This script walks several Deezer discovery sources to maximize coverage:
+
+  1. Genre charts          — top tracks per genre (~150 genres)
+  2. Editorial sections    — Deezer's curated playlists per region/mood
+  3. Radio stations        — algorithmic per-genre radio (~250 stations)
+  4. Per-year searches     — historical catalog 1960–2025
+
+With default settings it discovers ~10,000–15,000 unique tracks across
+sources, deduped. Already-cached tracks are skipped on re-runs.
 
 Usage:
     DATABASE_URL=... python3 prewarm.py
-    DATABASE_URL=... python3 prewarm.py --tracks 5000          # cap total
-    DATABASE_URL=... python3 prewarm.py --per-genre 100        # depth per genre
-    DATABASE_URL=... python3 prewarm.py --concurrency 4        # parallelism
-
-Already-cached tracks are skipped on re-runs, so this is safe to re-run any
-time you want to extend coverage (e.g. after Deezer's charts shift over a
-season).
+    DATABASE_URL=... python3 prewarm.py --tracks 8000
+    DATABASE_URL=... python3 prewarm.py --concurrency 4
+    DATABASE_URL=... python3 prewarm.py --sources genres,radio   # subset
 """
 
 import argparse
@@ -35,47 +37,148 @@ import client
 import deezer
 
 
-PER_GENRE_DEFAULT  = 100   # Deezer's max per chart-tracks request
-DEFAULT_TRACK_CAP  = 8000  # rough target — enough for solid midpoint search
-DEFAULT_CONCURRENCY = 2    # parallel librosa workers (CPU-bound)
+# ─── Defaults ───────────────────────────────────────────────────────────────
+
+PER_GENRE_LIMIT        = 100   # Deezer max per chart-tracks request
+PER_RADIO_LIMIT        = 40    # Radio endpoints return ~40 tracks max
+PER_EDITORIAL_LIMIT    = 100
+PER_YEAR_LIMIT         = 100
+
+# Year range for the per-year search source.
+YEAR_RANGE = (1960, 2025)
+
+DEFAULT_TRACK_CAP   = 10000
+DEFAULT_CONCURRENCY = 2
+
+# Discovery sources the script can run. Each name maps to a builder function
+# down below; --sources lets the user run subsets.
+ALL_SOURCES = ["genres", "editorial", "radio", "years"]
 
 
-# ─── Genre + track discovery ─────────────────────────────────────────────────
+# ─── HTTP helper ─────────────────────────────────────────────────────────────
 
-async def fetch_all_genres() -> list[dict]:
-    """Fetch Deezer's full genre list. ~150 entries including sub-genres."""
+async def _get(url: str, params: dict | None = None) -> dict | None:
+    """Hit a Deezer endpoint, return decoded JSON or None on any failure."""
     try:
-        r = await client.http_client.get(
-            "https://api.deezer.com/genre", timeout=10.0,
-        )
-        if r.status_code != 200:
-            return []
-        return r.json().get("data", []) or []
+        r = await client.http_client.get(url, params=params or {}, timeout=10.0)
+        if r.status_code == 200:
+            return r.json()
     except Exception as e:
-        print(f"  fetch_all_genres error: {e}")
-        return []
+        print(f"  fetch error ({url}): {e}")
+    return None
 
 
-async def fetch_genre_top_tracks(genre_id: int, limit: int) -> list[dict]:
-    """Pull the top tracks for one Deezer genre."""
-    try:
-        r = await client.http_client.get(
-            f"https://api.deezer.com/chart/{genre_id}/tracks",
-            params={"limit": limit},
-            timeout=10.0,
+# ─── Source 1: Genre charts ──────────────────────────────────────────────────
+
+async def discover_from_genres() -> list[dict]:
+    """Walk every Deezer genre and pull its top tracks."""
+    print(f"\n[1/4] Discovering from genre charts...")
+
+    data = await _get("https://api.deezer.com/genre")
+    genres = (data or {}).get("data", []) or []
+    print(f"      Got {len(genres)} genres.")
+
+    # Include the "All" chart too (genre id 0) for general top tracks.
+    entries = [{"id": 0, "name": "All"}] + genres
+
+    tracks: list[dict] = []
+    for entry in entries:
+        gid, gname = entry["id"], entry["name"]
+        data = await _get(
+            f"https://api.deezer.com/chart/{gid}/tracks",
+            params={"limit": PER_GENRE_LIMIT},
         )
-        if r.status_code != 200:
-            return []
-        return r.json().get("data", []) or []
-    except Exception as e:
-        print(f"  [genre {genre_id}] fetch error: {e}")
-        return []
+        batch = (data or {}).get("data", []) or []
+        tracks.extend(batch)
+        print(f"      {gname[:22]:22s} (genre {gid:4d}): +{len(batch):3d} tracks")
+
+    return tracks
+
+
+# ─── Source 2: Editorial sections ────────────────────────────────────────────
+
+async def discover_from_editorial() -> list[dict]:
+    """Pull tracks from each editorial section's charts."""
+    print(f"\n[2/4] Discovering from editorial sections...")
+
+    data = await _get("https://api.deezer.com/editorial")
+    editorials = (data or {}).get("data", []) or []
+    print(f"      Got {len(editorials)} editorial sections.")
+
+    tracks: list[dict] = []
+    for ed in editorials:
+        eid, ename = ed["id"], ed.get("name", "?")
+        data = await _get(
+            f"https://api.deezer.com/editorial/{eid}/charts/tracks",
+            params={"limit": PER_EDITORIAL_LIMIT},
+        )
+        batch = (data or {}).get("data", []) or []
+        tracks.extend(batch)
+        print(f"      {ename[:22]:22s} (ed {eid:4d}):    +{len(batch):3d} tracks")
+
+    return tracks
+
+
+# ─── Source 3: Radio stations ────────────────────────────────────────────────
+
+async def discover_from_radio() -> list[dict]:
+    """Pull tracks from every Deezer radio station's seed list."""
+    print(f"\n[3/4] Discovering from radio stations...")
+
+    data = await _get("https://api.deezer.com/radio")
+    radios = (data or {}).get("data", []) or []
+    print(f"      Got {len(radios)} radio stations.")
+
+    tracks: list[dict] = []
+    for radio in radios:
+        rid, rname = radio["id"], radio.get("title", "?")
+        data = await _get(
+            f"https://api.deezer.com/radio/{rid}/tracks",
+            params={"limit": PER_RADIO_LIMIT},
+        )
+        batch = (data or {}).get("data", []) or []
+        tracks.extend(batch)
+        # Radios are numerous; only log every ~10th to keep output readable.
+        if (rid % 10) == 0 or len(batch) > 30:
+            print(f"      {rname[:22]:22s} (radio {rid:5d}): +{len(batch):3d} tracks")
+
+    return tracks
+
+
+# ─── Source 4: Per-year searches ─────────────────────────────────────────────
+
+async def discover_from_years() -> list[dict]:
+    """Pull top tracks for each year in YEAR_RANGE via the search endpoint."""
+    start, end = YEAR_RANGE
+    print(f"\n[4/4] Discovering by year ({start}–{end})...")
+
+    tracks: list[dict] = []
+    for year in range(start, end + 1):
+        data = await _get(
+            "https://api.deezer.com/search",
+            params={"q": f"year:{year}", "limit": PER_YEAR_LIMIT},
+        )
+        batch = (data or {}).get("data", []) or []
+        tracks.extend(batch)
+        if batch:
+            print(f"      year {year}: +{len(batch):3d} tracks")
+
+    return tracks
+
+
+# ─── Discovery orchestrator ──────────────────────────────────────────────────
+
+SOURCE_FUNCS = {
+    "genres":    discover_from_genres,
+    "editorial": discover_from_editorial,
+    "radio":     discover_from_radio,
+    "years":     discover_from_years,
+}
 
 
 def deezer_track_to_dict(t: dict) -> dict:
-    """Convert raw Deezer search payload into the shape enrich_track expects."""
-    artist = t.get("artist", {})
-    album  = t.get("album",  {})
+    artist = t.get("artist", {}) or {}
+    album  = t.get("album",  {}) or {}
     return {
         "name":      t.get("title", ""),
         "artist":    artist.get("name", ""),
@@ -88,65 +191,50 @@ def deezer_track_to_dict(t: dict) -> dict:
     }
 
 
-# ─── Discovery: build the candidate set ──────────────────────────────────────
-
-async def discover_candidates(per_genre: int, target: int) -> list[dict]:
-    """Walk every Deezer genre and collect top tracks until we hit `target`."""
-    print(f"Fetching Deezer's full genre list...")
-    genres = await fetch_all_genres()
-    if not genres:
-        print("  Failed to fetch genres. Exiting.")
-        return []
-
-    # The "All" genre (id=0) plus everything Deezer returns. We include the
-    # All chart because it surfaces tracks that are popular across all genres
-    # (a good safety net for catching obvious hits regardless of genre tags).
-    genre_entries = [{"id": 0, "name": "All"}] + genres
-    print(f"  Got {len(genres)} genres, total to walk: {len(genre_entries)}")
-    print()
-
+async def discover_candidates(sources: list[str], target: int) -> list[dict]:
+    """Run each requested source, dedup by track ID, cap at target."""
     candidates: dict[str, dict] = {}
 
-    for entry in genre_entries:
+    for source_name in sources:
+        if source_name not in SOURCE_FUNCS:
+            print(f"  ! unknown source: {source_name} — skipping")
+            continue
         if len(candidates) >= target:
-            print(f"  Reached target of {target} unique tracks, stopping discovery.")
+            print(f"  Reached target of {target} unique tracks, stopping.")
             break
 
-        gid   = entry["id"]
-        gname = entry["name"]
-        raw_tracks = await fetch_genre_top_tracks(gid, per_genre)
+        raw_tracks = await SOURCE_FUNCS[source_name]()
+
         added = 0
         for t in raw_tracks:
             tid = str(t.get("id", ""))
             if tid and tid not in candidates:
                 candidates[tid] = deezer_track_to_dict(t)
                 added += 1
-        print(
-            f"  {gname[:22]:22s} (genre {gid:4d}): +{added:3d} new   "
-            f"(pool: {len(candidates)})"
-        )
+        print(f"      → {source_name}: +{added} unique  (running pool: {len(candidates)})")
 
     return list(candidates.values())[:target]
 
 
 # ─── The actual analysis loop ───────────────────────────────────────────────
 
-async def prewarm(per_genre: int, target: int, concurrency: int) -> None:
-    candidates = await discover_candidates(per_genre=per_genre, target=target)
-    print(f"\nDiscovered {len(candidates)} unique candidate tracks.\n")
+async def prewarm(sources: list[str], target: int, concurrency: int) -> None:
+    candidates = await discover_candidates(sources=sources, target=target)
+    print(f"\n{'='*60}")
+    print(f"Discovered {len(candidates)} unique candidate tracks across "
+          f"{len(sources)} sources.")
 
     if not candidates:
         return
 
-    # Skip anything already in the cache — running this script multiple
-    # times should be cheap, not redo all the work.
+    # Skip anything already in the cache.
     existing = await cache.get_many_cached([c["deezer_id"] for c in candidates])
     fresh = [c for c in candidates if str(c["deezer_id"]) not in existing]
     print(f"Already cached: {len(existing)}")
     print(f"To analyze:     {len(fresh)}\n")
 
     if not fresh:
-        print("Nothing to do — the cache is already fully warmed for this pool.")
+        print("Nothing to do — the cache is fully warmed for this pool.")
         return
 
     sem = asyncio.Semaphore(concurrency)
@@ -195,24 +283,28 @@ async def main() -> None:
         help=f"Cap on unique tracks to pre-warm. Default {DEFAULT_TRACK_CAP}.",
     )
     parser.add_argument(
-        "--per-genre", type=int, default=PER_GENRE_DEFAULT,
-        help=f"How many top tracks to pull per Deezer genre. Default {PER_GENRE_DEFAULT}.",
-    )
-    parser.add_argument(
         "--concurrency", type=int, default=DEFAULT_CONCURRENCY,
         help=(
-            "Parallel librosa analyses. Local laptop can probably handle 4-8; "
-            "leave at 2 if running this on the Render Starter dyno."
+            "Parallel librosa analyses. Laptop can handle 4-8; "
+            "leave at 2 for shared/free hosting."
+        ),
+    )
+    parser.add_argument(
+        "--sources", type=str, default=",".join(ALL_SOURCES),
+        help=(
+            f"Comma-separated discovery sources. Available: {','.join(ALL_SOURCES)}. "
+            f"Default runs all of them in order."
         ),
     )
     args = parser.parse_args()
 
-    # Init the global HTTP client and DB pool the same way app.py does.
+    sources = [s.strip() for s in args.sources.split(",") if s.strip()]
+
     client.http_client = httpx.AsyncClient(timeout=30.0)
     await cache.init_pool()
     try:
         await prewarm(
-            per_genre=args.per_genre,
+            sources=sources,
             target=args.tracks,
             concurrency=args.concurrency,
         )
